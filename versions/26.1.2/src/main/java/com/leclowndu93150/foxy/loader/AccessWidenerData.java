@@ -1,12 +1,9 @@
 package com.leclowndu93150.foxy.loader;
 
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-
 import net.neoforged.fml.loading.FMLPaths;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -23,10 +20,18 @@ import java.util.stream.Stream;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
+/** Access widener entries of every Fabric-only mod jar, plus Foxy's own supplement. */
 public final class AccessWidenerData {
-    public final Set<String> classes = new HashSet<>();
-    public final Map<String, Set<String>> fields = new HashMap<>();
-    public final Map<String, Set<String>> methods = new HashMap<>();
+    public static final int ACCESSIBLE = 1;
+    public static final int EXTENDABLE = 2;
+    public static final int MUTABLE = 4;
+
+    /** Dotted class name to access flags. */
+    public final Map<String, Integer> classes = new HashMap<>();
+    /** Dotted owner to field name to access flags. */
+    public final Map<String, Map<String, Integer>> fields = new HashMap<>();
+    /** Dotted owner to name+descriptor to access flags. */
+    public final Map<String, Map<String, Integer>> methods = new HashMap<>();
 
     private static AccessWidenerData instance;
 
@@ -41,8 +46,11 @@ public final class AccessWidenerData {
         AccessWidenerData data = new AccessWidenerData();
         for (Path jar : candidateJars()) {
             try (ZipFile zip = new ZipFile(jar.toFile())) {
-                if (zip.getEntry("fabric.mod.json") == null) continue;
-                String awName = readAwName(zip);
+                ZipEntry fmjEntry = zip.getEntry(FabricModJson.FILE);
+                // Multi-loader jars ship a NeoForge build; their Fabric access widener is not for this loader.
+                if (fmjEntry == null || zip.getEntry(FabricModJson.NEOFORGE_MODS_TOML) != null) continue;
+                FabricModJson fmj = FabricModJson.parse(zip.getInputStream(fmjEntry));
+                String awName = fmj == null ? null : fmj.accessWidener();
                 if (awName == null) continue;
                 ZipEntry awEntry = zip.getEntry(awName);
                 if (awEntry == null) continue;
@@ -61,7 +69,7 @@ public final class AccessWidenerData {
 
     private static List<Path> candidateJars() {
         List<Path> jars = new ArrayList<>();
-        for (String entry : System.getProperty("java.class.path", "").split(System.getProperty("path.separator"))) {
+        for (String entry : System.getProperty("java.class.path", "").split(File.pathSeparator)) {
             if (entry.endsWith(".jar")) {
                 jars.add(Path.of(entry));
             }
@@ -75,17 +83,6 @@ public final class AccessWidenerData {
             }
         } catch (Throwable ignored) {}
         return jars;
-    }
-
-    private static String readAwName(ZipFile zip) throws IOException {
-        ZipEntry fmj = zip.getEntry("fabric.mod.json");
-        try (InputStream is = zip.getInputStream(fmj)) {
-            JsonObject obj = JsonParser.parseReader(new InputStreamReader(is, StandardCharsets.UTF_8)).getAsJsonObject();
-            JsonElement aw = obj.get("accessWidener");
-            return aw != null && aw.isJsonPrimitive() ? aw.getAsString() : null;
-        } catch (IllegalStateException e) {
-            return null;
-        }
     }
 
     private void parse(InputStream is) throws IOException {
@@ -103,21 +100,25 @@ public final class AccessWidenerData {
                 }
                 String[] parts = line.split("\\s+");
                 if (parts.length < 3) continue;
-                String access = parts[0];
-                if (!access.equals("accessible") && !access.equals("extendable") && !access.equals("mutable")) {
-                    continue;
-                }
-                String type = parts[1];
-                switch (type) {
-                    case "class" -> classes.add(parts[2].replace('/', '.'));
+                String access = parts[0].startsWith("transitive-") ? parts[0].substring("transitive-".length()) : parts[0];
+                int flag = switch (access) {
+                    case "accessible" -> ACCESSIBLE;
+                    case "extendable" -> EXTENDABLE;
+                    case "mutable" -> MUTABLE;
+                    default -> 0;
+                };
+                if (flag == 0) continue;
+                String owner = parts[2].replace('/', '.');
+                switch (parts[1]) {
+                    case "class" -> classes.merge(owner, flag, (a, b) -> a | b);
                     case "field" -> {
                         if (parts.length >= 5) {
-                            fields.computeIfAbsent(parts[2].replace('/', '.'), k -> new HashSet<>()).add(parts[3]);
+                            fields.computeIfAbsent(owner, k -> new HashMap<>()).merge(parts[3], flag, (a, b) -> a | b);
                         }
                     }
                     case "method" -> {
                         if (parts.length >= 5) {
-                            methods.computeIfAbsent(parts[2].replace('/', '.'), k -> new HashSet<>()).add(parts[3] + parts[4]);
+                            methods.computeIfAbsent(owner, k -> new HashMap<>()).merge(parts[3] + parts[4], flag, (a, b) -> a | b);
                         }
                     }
                     default -> {}
@@ -127,7 +128,7 @@ public final class AccessWidenerData {
     }
 
     public Set<String> allTargets() {
-        Set<String> all = new HashSet<>(classes);
+        Set<String> all = new HashSet<>(classes.keySet());
         all.addAll(fields.keySet());
         all.addAll(methods.keySet());
         return all;

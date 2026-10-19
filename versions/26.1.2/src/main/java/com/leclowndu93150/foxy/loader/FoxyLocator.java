@@ -10,26 +10,26 @@ import net.neoforged.neoforgespi.locating.ModFileDiscoveryAttributes;
 import java.io.File;
 import java.io.IOException;
 import java.net.URI;
-import java.net.URISyntaxException;
-import java.net.URL;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.Enumeration;
 import java.util.List;
+import java.util.zip.ZipFile;
 
+/**
+ * Re-adds Foxy itself as a mod and picks up Fabric jars that sit on the class path (development
+ * runs); Fabric jars in the mods folder are found by FML's own mods-folder locator.
+ */
 public class FoxyLocator implements IModFileCandidateLocator {
 
     @Override
     public void findCandidates(ILaunchContext context, IDiscoveryPipeline pipeline) {
         readdSelf(pipeline);
 
-        try {
-            Path voxyJar = findVoxyJar();
-            if (voxyJar != null && !context.isLocated(voxyJar)) {
-                pipeline.addPath(voxyJar, ModFileDiscoveryAttributes.DEFAULT, IncompatibleFileReporting.WARN_ON_KNOWN_INCOMPATIBILITY);
+        for (Path jar : classPathFabricJars()) {
+            if (!context.isLocated(jar)) {
+                pipeline.addPath(jar, ModFileDiscoveryAttributes.DEFAULT, IncompatibleFileReporting.WARN_ON_KNOWN_INCOMPATIBILITY);
             }
-        } catch (Exception e) {
-            throw new RuntimeException("Foxy: failed to locate Voxy jar", e);
         }
     }
 
@@ -66,24 +66,20 @@ public class FoxyLocator implements IModFileCandidateLocator {
         return paths;
     }
 
-    private static Path findVoxyJar() throws URISyntaxException, IOException {
-        ClassLoader cl = Thread.currentThread().getContextClassLoader();
-        Enumeration<URL> urls = cl.getResources("fabric.mod.json");
-        while (urls.hasMoreElements()) {
-            URL url = urls.nextElement();
-            String urlStr = url.toString();
-            if (urlStr.contains("voxy")) {
-                String jarPath = urlStr.substring("jar:".length(), urlStr.indexOf("!/"));
-                return Path.of(new URI(jarPath));
-            }
+    /** Class path jars that are Fabric-only mods (same criterion as {@link FoxyFabricModReader}). */
+    private static List<Path> classPathFabricJars() {
+        List<Path> jars = new ArrayList<>();
+        for (String entry : System.getProperty("java.class.path", "").split(File.pathSeparator)) {
+            if (!entry.endsWith(".jar")) continue;
+            Path path = Path.of(entry);
+            if (!Files.isRegularFile(path)) continue;
+            try (ZipFile zip = new ZipFile(path.toFile())) {
+                if (zip.getEntry(FabricModJson.FILE) != null && zip.getEntry(FabricModJson.NEOFORGE_MODS_TOML) == null) {
+                    jars.add(path);
+                }
+            } catch (IOException ignored) {}
         }
-        String cp = System.getProperty("java.class.path", "");
-        for (String entry : cp.split(System.getProperty("path.separator"))) {
-            if (entry.contains("voxy") && entry.endsWith(".jar")) {
-                return Path.of(entry);
-            }
-        }
-        return null;
+        return jars;
     }
 
     @Override

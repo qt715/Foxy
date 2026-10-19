@@ -23,12 +23,5 @@ versionRange = "[${minecraft_version},)"
 ordering = "NONE"
 side = "BOTH"
 
-[[dependencies.${mod_id}]]
-modId = "sodium"
-type = "required"
-versionRange = "[0.8.12,)"
-ordering = "NONE"
-side = "CLIENT"
-
 [[mixins]]
 config = "${mod_id}.mixins.json"

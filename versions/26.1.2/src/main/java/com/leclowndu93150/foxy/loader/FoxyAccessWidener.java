@@ -8,6 +8,7 @@ import org.objectweb.asm.tree.ClassNode;
 import org.objectweb.asm.tree.FieldNode;
 import org.objectweb.asm.tree.MethodNode;
 
+import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -30,32 +31,47 @@ public class FoxyAccessWidener extends SimpleClassProcessor {
     public void transform(ClassNode node, SimpleTransformationContext context) {
         String className = node.name.replace('/', '.');
 
-        if (data.classes.contains(className)) {
-            node.access = toPublic(node.access);
+        Integer classAccess = data.classes.get(className);
+        if (classAccess != null) {
+            node.access = widenClass(node.access, classAccess);
             for (var inner : node.innerClasses) {
                 if (inner.name.equals(node.name)) {
-                    inner.access = toPublic(inner.access);
+                    inner.access = widenClass(inner.access, classAccess);
                 }
             }
         }
 
-        Set<String> wideFields = data.fields.get(className);
+        Map<String, Integer> wideFields = data.fields.get(className);
         if (wideFields != null) {
             for (FieldNode field : node.fields) {
-                if (wideFields.contains(field.name)) {
-                    field.access = toPublic(field.access);
-                }
+                Integer access = wideFields.get(field.name);
+                if (access == null) continue;
+                if ((access & AccessWidenerData.ACCESSIBLE) != 0) field.access = toPublic(field.access);
+                if ((access & AccessWidenerData.MUTABLE) != 0) field.access &= ~Opcodes.ACC_FINAL;
             }
         }
 
-        Set<String> wideMethods = data.methods.get(className);
+        Map<String, Integer> wideMethods = data.methods.get(className);
         if (wideMethods != null) {
             for (MethodNode method : node.methods) {
-                if (wideMethods.contains(method.name + method.desc)) {
+                Integer access = wideMethods.get(method.name + method.desc);
+                if (access == null) continue;
+                if ((access & AccessWidenerData.ACCESSIBLE) != 0) {
                     method.access = toPublic(method.access);
+                }
+                if ((access & AccessWidenerData.EXTENDABLE) != 0) {
+                    if ((method.access & (Opcodes.ACC_PUBLIC | Opcodes.ACC_PROTECTED)) == 0) {
+                        method.access = (method.access & ~VISIBILITY_MASK) | Opcodes.ACC_PROTECTED;
+                    }
+                    method.access &= ~Opcodes.ACC_FINAL;
                 }
             }
         }
+    }
+
+    private static int widenClass(int access, int flags) {
+        int widened = toPublic(access);
+        return (flags & AccessWidenerData.EXTENDABLE) != 0 ? widened & ~Opcodes.ACC_FINAL : widened;
     }
 
     private static int toPublic(int access) {

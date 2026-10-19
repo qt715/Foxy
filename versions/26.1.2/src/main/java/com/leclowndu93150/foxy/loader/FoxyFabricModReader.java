@@ -2,52 +2,81 @@ package com.leclowndu93150.foxy.loader;
 
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
 import net.neoforged.fml.jarcontents.JarContents;
 import net.neoforged.fml.loading.moddiscovery.readers.JarModsDotTomlModFileReader;
 import net.neoforged.neoforgespi.locating.IModFile;
 import net.neoforged.neoforgespi.locating.IModFileReader;
 import net.neoforged.neoforgespi.locating.ModFileDiscoveryAttributes;
 import org.jetbrains.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.Set;
 import java.util.StringJoiner;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipOutputStream;
 
+/**
+ * Claims Fabric-only jars and hands FML a temporary copy with a {@code neoforge.mods.toml}
+ * generated from {@code fabric.mod.json} and its {@code net.fabricmc} references pointed at Foxy's
+ * shim ({@link FabricApiRelocation}). The jar in the mods folder is never modified.
+ */
 public class FoxyFabricModReader implements IModFileReader {
-    private static final String MODS_TOML = "META-INF/neoforge.mods.toml";
+    private static final Logger LOGGER = LoggerFactory.getLogger("Foxy");
+
+    /** Fabric entrypoints Foxy invokes itself; every other key is exposed as a mod property. */
+    private static final Set<String> LIFECYCLE_ENTRYPOINTS = Set.of("main", "client", "server");
+    /** Dependencies provided by the platform itself (Foxy stands in for Fabric Loader and the Fabric API surface it bridges). */
+    private static final Set<String> PLATFORM_DEPENDENCIES = Set.of("minecraft", "java", "fabricloader", "fabric", "fabric-api", "quilt_loader");
+    /**
+     * Older Voxy builds read {@code custom.commit} unconditionally; development jars ship the
+     * unexpanded {@code ${commit}} placeholder.
+     */
+    private static final String FALLBACK_COMMIT = "foxycompat0000000000000000000000000000000";
 
     @Override
     public @Nullable IModFile read(JarContents jar, ModFileDiscoveryAttributes attributes) {
-        if (!jar.containsFile("fabric.mod.json") || jar.containsFile(MODS_TOML)) {
+        if (!jar.containsFile(FabricModJson.FILE) || jar.containsFile(FabricModJson.NEOFORGE_MODS_TOML)) {
+            return null;
+        }
+        if (!Files.isRegularFile(jar.getPrimaryPath())) {
+            return null;
+        }
+        // Jars nested in another mod (NeoForge jar-in-jar) are that mod's libraries, even when they
+        // carry Fabric metadata, e.g. multi-loader libraries bundled by LambDynamicLights.
+        if (attributes.parent() != null) {
             return null;
         }
 
-        JsonObject fmj = readFabricModJson(jar);
+        FabricModJson fmj;
+        try {
+            fmj = FabricModJson.parse(jar.openFile(FabricModJson.FILE));
+        } catch (IOException e) {
+            return null;
+        }
         if (fmj == null) {
             return null;
         }
 
         try {
             Path patched = patchJar(jar.getPrimaryPath(), fmj);
+            LOGGER.info("Foxy: loading Fabric mod {} {} from {}", fmj.id(), fmj.version(), jar.getPrimaryPath().getFileName());
             return JarModsDotTomlModFileReader.createModFile(JarContents.ofPath(patched), attributes);
         } catch (IOException e) {
-            throw new RuntimeException("Foxy: failed to patch Voxy jar", e);
+            throw new RuntimeException("Foxy: failed to prepare Fabric mod " + fmj.id() + " from " + jar.getPrimaryPath(), e);
         }
     }
 
-    private static Path patchJar(Path original, JsonObject fmj) throws IOException {
-        String modId = string(fmj, "id", "voxy");
-        Path patched = Files.createTempFile("foxy-patched-" + modId + "-", ".jar");
+    private static Path patchJar(Path original, FabricModJson fmj) throws IOException {
+        Path patched = Files.createTempFile("foxy-patched-" + fmj.neoForgeId() + "-", ".jar");
         patched.toFile().deleteOnExit();
 
         try (ZipFile in = new ZipFile(original.toFile());
@@ -55,89 +84,145 @@ public class FoxyFabricModReader implements IModFileReader {
             var entries = in.entries();
             while (entries.hasMoreElements()) {
                 ZipEntry entry = entries.nextElement();
-                if (entry.getName().equals(MODS_TOML)) continue;
+                if (entry.getName().equals(FabricModJson.NEOFORGE_MODS_TOML)) continue;
                 out.putNextEntry(new ZipEntry(entry.getName()));
                 if (!entry.isDirectory()) {
                     try (InputStream is = in.getInputStream(entry)) {
-                        is.transferTo(out);
+                        if (entry.getName().endsWith(".class")) {
+                            out.write(FabricApiRelocation.relocate(is.readAllBytes()));
+                        } else {
+                            is.transferTo(out);
+                        }
                     }
                 }
                 out.closeEntry();
             }
-            out.putNextEntry(new ZipEntry(MODS_TOML));
+            out.putNextEntry(new ZipEntry(FabricModJson.NEOFORGE_MODS_TOML));
             out.write(buildModsToml(fmj).getBytes(StandardCharsets.UTF_8));
             out.closeEntry();
         }
         return patched;
     }
 
-    private static String buildModsToml(JsonObject fmj) {
-        String modId = string(fmj, "id", "voxy");
-        String version = string(fmj, "version", "0.0.0");
-        String name = string(fmj, "name", modId);
-        String description = string(fmj, "description", "");
-        String icon = string(fmj, "icon", null);
-        String authors = joinAuthors(fmj);
-        String commit = readCommit(fmj);
+    static String buildModsToml(FabricModJson fmj) {
+        JsonObject json = fmj.json();
+        String modId = fmj.neoForgeId();
+        String name = FabricModJson.string(json, "name", fmj.id());
+        String description = FabricModJson.string(json, "description", "");
+        String icon = icon(json);
+        String authors = joinAuthors(json);
 
         StringBuilder sb = new StringBuilder();
         sb.append("modLoader = \"javafml\"\n");
-        sb.append("loaderVersion = \"[4,)\"\n");
-        sb.append("license = \"").append(esc(string(fmj, "license", "All-Rights-Reserved"))).append("\"\n");
-        if (!authors.isEmpty()) {
-            sb.append("authors = \"").append(esc(authors)).append("\"\n");
-        }
+        sb.append("loaderVersion = \"[1,)\"\n");
+        sb.append("license = ").append(str(FabricModJson.string(json, "license", "All-Rights-Reserved"))).append('\n');
         sb.append("[[mods]]\n");
-        sb.append("modId = \"").append(esc(modId)).append("\"\n");
-        sb.append("version = \"").append(esc(version)).append("\"\n");
-        sb.append("displayName = \"").append(esc(name)).append("\"\n");
-        if (!description.isEmpty()) {
-            sb.append("description = \"").append(esc(description)).append("\"\n");
-        }
-        if (icon != null) {
-            sb.append("logoFile = \"").append(esc(icon)).append("\"\n");
-        }
+        sb.append("modId = ").append(str(modId)).append('\n');
+        sb.append("version = ").append(str(fmj.version())).append('\n');
+        sb.append("displayName = ").append(str(name)).append('\n');
+        if (!description.isEmpty()) sb.append("description = ").append(str(description)).append('\n');
+        if (!authors.isEmpty()) sb.append("authors = ").append(str(authors)).append('\n');
+        if (icon != null) sb.append("logoFile = ").append(str(icon)).append('\n');
+
         sb.append("[modproperties.").append(modId).append("]\n");
-        sb.append("commit = \"").append(esc(commit)).append("\"\n");
-        sb.append("[[dependencies.").append(modId).append("]]\n");
-        sb.append("modId = \"neoforge\"\ntype = \"required\"\nversionRange = \"[4,)\"\nordering = \"NONE\"\nside = \"BOTH\"\n");
-        sb.append("[[dependencies.").append(modId).append("]]\n");
-        sb.append("modId = \"sodium\"\ntype = \"required\"\nversionRange = \"[0.8,)\"\nordering = \"NONE\"\nside = \"CLIENT\"\n");
-        for (String mixin : readMixins(fmj)) {
-            sb.append("[[mixins]]\nconfig = \"").append(esc(mixin)).append("\"\n");
+        for (Map.Entry<String, String> property : modProperties(fmj).entrySet()) {
+            sb.append(str(property.getKey())).append(" = ").append(str(property.getValue())).append('\n');
+        }
+
+        dependency(sb, modId, "neoforge", "required", "[1,)", "BOTH");
+        JsonObject depends = FabricModJson.object(json, "depends");
+        if (depends != null) {
+            for (Map.Entry<String, JsonElement> dep : depends.entrySet()) {
+                if (isPlatformDependency(dep.getKey())) continue;
+                // Fabric dependencies carry no side, but client-only mods (Sodium, Iris, ...) are
+                // absent on dedicated servers, where Fabric jars satisfy them with "provides"
+                // stubs Foxy does not load. A BOTH-side requirement would make such mods
+                // unloadable on servers.
+                dependency(sb, modId, FabricModJson.toNeoForgeId(dep.getKey()), "required",
+                        FabricVersionRanges.lowestLowerBound(dep.getValue()), "CLIENT");
+            }
+        }
+        JsonObject breaks = FabricModJson.object(json, "breaks");
+        if (breaks != null) {
+            for (Map.Entry<String, JsonElement> dep : breaks.entrySet()) {
+                if (isPlatformDependency(dep.getKey())) continue;
+                for (String range : FabricVersionRanges.exactRanges(dep.getValue())) {
+                    dependency(sb, modId, FabricModJson.toNeoForgeId(dep.getKey()), "incompatible", range, "BOTH");
+                    sb.append("reason = ").append(str(fmj.id() + " declares itself incompatible with " + dep.getKey() + " " + range)).append('\n');
+                }
+            }
+        }
+
+        for (String mixin : fmj.mixinConfigs()) {
+            sb.append("[[mixins]]\nconfig = ").append(str(mixin)).append('\n');
         }
         return sb.toString();
     }
 
-    private static List<String> readMixins(JsonObject fmj) {
-        List<String> result = new ArrayList<>();
-        JsonElement mixins = fmj.get("mixins");
-        if (mixins != null && mixins.isJsonArray()) {
-            for (JsonElement el : mixins.getAsJsonArray()) {
-                if (el.isJsonPrimitive()) {
-                    result.add(el.getAsString());
-                } else if (el.isJsonObject() && el.getAsJsonObject().has("config")) {
-                    result.add(el.getAsJsonObject().get("config").getAsString());
+    /**
+     * Mod properties: Fabric {@code custom} values, then one property per non-lifecycle entrypoint
+     * (NeoForge integrations such as Sodium's {@code sodium:config_api_user} read class names from
+     * mod properties), then Foxy's marker.
+     */
+    private static Map<String, String> modProperties(FabricModJson fmj) {
+        Map<String, String> properties = new LinkedHashMap<>();
+        JsonObject custom = FabricModJson.object(fmj.json(), "custom");
+        if (custom != null) {
+            for (Map.Entry<String, JsonElement> entry : custom.entrySet()) {
+                if (entry.getValue().isJsonPrimitive()) {
+                    String value = entry.getValue().getAsString();
+                    if (!value.startsWith("$")) properties.put(entry.getKey(), value);
                 }
             }
         }
-        return result;
-    }
-
-    private static String readCommit(JsonObject fmj) {
-        JsonElement custom = fmj.get("custom");
-        if (custom != null && custom.isJsonObject()) {
-            JsonElement commit = custom.getAsJsonObject().get("commit");
-            if (commit != null && commit.isJsonPrimitive()) {
-                String c = commit.getAsString();
-                if (!c.startsWith("$")) return c;
-            }
+        properties.putIfAbsent("commit", FALLBACK_COMMIT);
+        for (String key : fmj.entrypointKeys()) {
+            if (LIFECYCLE_ENTRYPOINTS.contains(key)) continue;
+            var classes = fmj.entrypoints(key);
+            if (!classes.isEmpty()) properties.putIfAbsent(key, classes.getFirst());
         }
-        return "foxycompat0000000000000000000000000000000";
+        properties.put(FabricModJson.FOXY_MARKER_PROPERTY, fmj.id());
+        return properties;
     }
 
-    private static String joinAuthors(JsonObject fmj) {
-        JsonElement authors = fmj.get("authors");
+    private static void dependency(StringBuilder sb, String owner, String modId, String type, String range, String side) {
+        sb.append("[[dependencies.").append(owner).append("]]\n");
+        sb.append("modId = ").append(str(modId)).append('\n');
+        sb.append("type = ").append(str(type)).append('\n');
+        sb.append("versionRange = ").append(str(range)).append('\n');
+        sb.append("ordering = \"NONE\"\n");
+        sb.append("side = ").append(str(side)).append('\n');
+    }
+
+    private static boolean isPlatformDependency(String id) {
+        return PLATFORM_DEPENDENCIES.contains(id) || id.startsWith("fabric-") || id.startsWith("fabric_");
+    }
+
+    @Nullable
+    private static String icon(JsonObject json) {
+        JsonElement icon = json.get("icon");
+        if (icon == null) return null;
+        if (icon.isJsonPrimitive()) return FabricModJson.string(json, "icon", null);
+        if (icon.isJsonObject()) {
+            // Size-keyed icon map: pick the largest.
+            String best = null;
+            int bestSize = -1;
+            for (Map.Entry<String, JsonElement> entry : icon.getAsJsonObject().entrySet()) {
+                try {
+                    int size = Integer.parseInt(entry.getKey());
+                    if (size > bestSize && entry.getValue().isJsonPrimitive()) {
+                        bestSize = size;
+                        best = entry.getValue().getAsString();
+                    }
+                } catch (NumberFormatException ignored) {}
+            }
+            return best;
+        }
+        return null;
+    }
+
+    private static String joinAuthors(JsonObject json) {
+        JsonElement authors = json.get("authors");
         if (authors == null || !authors.isJsonArray()) return "";
         StringJoiner sj = new StringJoiner(", ");
         for (JsonElement el : authors.getAsJsonArray()) {
@@ -150,25 +235,23 @@ public class FoxyFabricModReader implements IModFileReader {
         return sj.toString();
     }
 
-    @Nullable
-    private static JsonObject readFabricModJson(JarContents jar) {
-        try (InputStream is = jar.openFile("fabric.mod.json")) {
-            if (is == null) return null;
-            return JsonParser.parseReader(new InputStreamReader(is, StandardCharsets.UTF_8)).getAsJsonObject();
-        } catch (IOException | IllegalStateException e) {
-            return null;
+    /** TOML basic string. */
+    private static String str(String s) {
+        StringBuilder sb = new StringBuilder("\"");
+        for (char c : s.toCharArray()) {
+            switch (c) {
+                case '\\' -> sb.append("\\\\");
+                case '"' -> sb.append("\\\"");
+                case '\n' -> sb.append("\\n");
+                case '\r' -> sb.append("\\r");
+                case '\t' -> sb.append("\\t");
+                default -> {
+                    if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
+                    else sb.append(c);
+                }
+            }
         }
-    }
-
-    private static String string(JsonObject obj, String key, String fallback) {
-        JsonElement el = obj.get(key);
-        if (el == null || !el.isJsonPrimitive()) return fallback;
-        String s = el.getAsString();
-        return s.startsWith("$") ? fallback : s;
-    }
-
-    private static String esc(String s) {
-        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+        return sb.append('"').toString();
     }
 
     @Override
