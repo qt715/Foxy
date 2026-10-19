@@ -71,6 +71,11 @@ surface listed below.
     `ServerPlayNetworking`, `ClientPlayNetworking`, `PacketSender`. Payload types are registered
     as optional NeoForge play payloads, so servers and clients without the mod still connect.
 - **Chunky.** A mixin into Chunky's `NeoForgeWorld` feeds chunks Chunky generates into Voxy.
+- **Worldgen deadlock fix.** Zombie villagers placed by structures (igloos) look up their biome
+  while still being constructed at the world origin. On a worldgen thread that lookup goes
+  through the server thread, and if chunk 0,0 is itself generating at that moment the server
+  hangs for good. Voxy World Gen V2's background generation makes this reachable in normal play.
+  Off the server thread Foxy takes that biome from the world generator instead.
 
 ## Building
 
